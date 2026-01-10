@@ -113,36 +113,78 @@ class UltimateDataPipeline:
             logger.info("✅ No se detectaron valores nulos para imputar.")
         return self
 
-    def handle_outliers(self, threshold: float = 1.5) -> 'UltimateDataPipeline':
-        """4. Detección de valores extremos mediante IQR."""
+    def handle_outliers(self, threshold: float = 1.5, method: str = 'cap') -> 'UltimateDataPipeline':
+        """
+        4. Manejo de valores extremos (outliers) mediante IQR.
+        
+        Args:
+            threshold (float): Multiplicador del IQR (rango intercuartílico). Default 1.5.
+            method (str): Estrategia de manejo. 
+                          'cap': Suaviza valores (Winsorizing) al límite superior/inferior.
+                          'remove': Elimina las filas completas que contienen outliers.
+        """
         if self.df.empty:
             return self
 
         num_cols = self.df.select_dtypes(include=[np.number]).columns
-        outlier_cols = 0
         
-        for col in num_cols:
-            Q1 = self.df[col].quantile(0.25)
-            Q3 = self.df[col].quantile(0.75)
-            IQR = Q3 - Q1
+        if method == 'remove':
+            initial_rows = len(self.df)
+            mask = pd.Series(True, index=self.df.index)
             
-            if IQR == 0: continue
+            for col in num_cols:
+                Q1 = self.df[col].quantile(0.25)
+                Q3 = self.df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                
+                if IQR == 0: continue
 
-            lower_bound = Q1 - threshold * IQR
-            upper_bound = Q3 + threshold * IQR
+                lower_bound = Q1 - threshold * IQR
+                upper_bound = Q3 + threshold * IQR
+                
+                # Identificar filas que están DENTRO del rango permitido
+                col_mask = (self.df[col] >= lower_bound) & (self.df[col] <= upper_bound)
+                # Ojo: los NaNs a veces evalúan False en comparaciones, aseguramos no eliminar NaNs aquí (eso es tarea de impute_missing)
+                # Si queremos ser estrictos con outliers de lo que NO es NaN:
+                col_valid = self.df[col].notna()
+                col_mask = col_mask | (~col_valid) # Mantenemos NaNs
+                
+                mask = mask & col_mask
+
+            self.df = self.df[mask]
+            removed = initial_rows - len(self.df)
+            if removed > 0:
+                logger.info(f"✅ Eliminadas {removed} filas con outliers.")
+            else:
+                logger.info("✅ No se detectaron outliers para eliminar.")
+
+        elif method == 'cap':
+            outlier_cols = 0
+            for col in num_cols:
+                Q1 = self.df[col].quantile(0.25)
+                Q3 = self.df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                
+                if IQR == 0: continue
+
+                lower_bound = Q1 - threshold * IQR
+                upper_bound = Q3 + threshold * IQR
+                
+                has_outliers = ((self.df[col] < lower_bound) | (self.df[col] > upper_bound)).any()
+                if has_outliers:
+                    outlier_cols += 1
+                    self.df[col] = np.where(self.df[col] < lower_bound, lower_bound, self.df[col])
+                    self.df[col] = np.where(self.df[col] > upper_bound, upper_bound, self.df[col])
             
-            # Detectar si hay outliers antes de modificar
-            has_outliers = ((self.df[col] < lower_bound) | (self.df[col] > upper_bound)).any()
-            if has_outliers:
-                outlier_cols += 1
-                # Capamos los valores (Winsorizing)
-                self.df[col] = np.where(self.df[col] < lower_bound, lower_bound, self.df[col])
-                self.df[col] = np.where(self.df[col] > upper_bound, upper_bound, self.df[col])
+            if outlier_cols > 0:
+                logger.info(f"✅ Outliers suavizados (Winsorizing) en {outlier_cols} columnas.")
+            else:
+                logger.info("✅ No se detectaron outliers significativos.")
         
-        if outlier_cols > 0:
-            logger.info(f"✅ Outliers suavizados (Winsorizing) en {outlier_cols} columnas.")
         else:
-            logger.info("✅ No se detectaron outliers significativos.")
+            logger.error(f"❌ Método '{method}' no reconocido. Use 'cap' o 'remove'.")
+            raise ValueError(f"Método '{method}' no válido.")
+
         return self
 
     def optimize(self) -> 'UltimateDataPipeline':
@@ -194,22 +236,26 @@ if __name__ == "__main__":
     file_path = Path('mi_data_sucia.csv')
     
     # Creamos un archivo dummy si no existe para probar
-    if not file_path.exists():
-        logger.info("Creando archivo dummy para prueba...")
-        df_dummy = pd.DataFrame({
-            'Nombre ': ['Juan', 'Ana', 'Juan', ' Pedro '],
-            ' Edad': [25, 30, 25, 120], # 120 es outlier
-            'Fecha Registro': ['2023-01-01', '2023-02-01', '2023-01-01', None],
-            'Score': [10.5, np.nan, 10.5, 5.0]
-        })
-        df_dummy.to_csv(file_path, index=False)
+    # Forzamos recreación para probar cambios
+    logger.info("Creando archivo dummy para prueba...")
+    df_dummy = pd.DataFrame({
+        'Nombre ': ['Juan', 'Ana', 'Juan', ' Pedro ', 'OutlierMan'],
+        ' Edad': [25, 30, 25, 120, 1500], # 120 y 1500 son outliers
+        'Fecha Registro': ['2023-01-01', '2023-02-01', '2023-01-01', None, '2023-05-01'],
+        'Score': [10.5, np.nan, 10.5, 5.0, 1000.0] # 1000 es outlier
+    })
+    df_dummy.to_csv(file_path, index=False)
 
+    print("\n--- PRUEBA 1: Winsorizing (cap) ---")
     pipeline = UltimateDataPipeline(file_path)
-    
     (pipeline
      .standardize()
-     .handle_garbage()
-     .impute_missing()
-     .handle_outliers()
-     .optimize()
+     .handle_outliers(method='cap')
+     .df)
+    
+    print("\n--- PRUEBA 2: Eliminación (remove) ---")
+    pipeline_remove = UltimateDataPipeline(file_path)
+    (pipeline_remove
+     .standardize()
+     .handle_outliers(method='remove')
      .export('resultado_limpio.xlsx', format='excel'))
